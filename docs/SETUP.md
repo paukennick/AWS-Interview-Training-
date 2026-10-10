@@ -61,7 +61,7 @@ export ANTHROPIC_API_KEY=sk-ant-...     # never put this in the browser
 npm run coach-server                     # http://localhost:8787
 ```
 
-Then in the app: Settings → Coaching engine → select Claude, enter `http://localhost:8787`, click Test, and tick the consent box. Optional environment variables: `COACH_PORT`, `COACH_MODEL` (default `claude-opus-5-5`), `COACH_ALLOWED_ORIGIN` (default `*`; set it to your app origin in production).
+Then in the app: Settings → Coaching engine → select Claude, enter `http://localhost:8787`, click Test, and tick the consent box. Optional environment variables: `COACH_PORT`, `COACH_MODEL` (default `claude-sonnet-5-5`), `COACH_FALLBACK_MODEL` (default `claude-haiku-5-5`; tried once when the main model declines, is rate limited or the API fails; it must not cost more than the main model, and an empty value turns it off), `COACH_ALLOWED_ORIGIN` (default `*`; set it to your app origin in production).
 
 The proxy only ever receives transcripts (never audio) and only when consent is given. If it is unreachable, every report falls back to the rule-based engine and says so.
 

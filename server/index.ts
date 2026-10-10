@@ -9,7 +9,7 @@
  *   ANTHROPIC_API_KEY=sk-ant-... npm run coach-server
  *
  * Endpoints:
- *   GET  /api/health      -> { ok, model, hasKey }
+ *   GET  /api/health      -> { ok, model, fallbackModel, hasKey }
  *   POST /api/coach       -> FeedbackReport-shaped JSON (see src/domain/types.ts)
  *   POST /api/study/grade -> { verdict, feedback, missedPoints, model } for a Study
  *                            explain-it-back answer or a unit scenario, graded
@@ -19,7 +19,11 @@ import { createServer } from "node:http";
 import Anthropic from "@anthropic-ai/sdk";
 
 const PORT = Number(process.env.COACH_PORT ?? 8787);
-const MODEL = process.env.COACH_MODEL ?? "claude-opus-5-5";
+const MODEL = process.env.COACH_MODEL ?? "claude-sonnet-5-5";
+// Tried once when MODEL declines, is rate limited or is failing. It must not cost more than MODEL. The API's
+// server-side `fallbacks` option is not used because it picks its own model per refusal category and may pick
+// a larger one. Set COACH_FALLBACK_MODEL to an empty string to turn the fallback off.
+const FALLBACK_MODEL = process.env.COACH_FALLBACK_MODEL ?? "claude-haiku-5-5";
 const ALLOWED_ORIGIN = process.env.COACH_ALLOWED_ORIGIN ?? "*";
 
 const SYSTEM = `You are an interview coach for Amazon/AWS-style behavioral interviews, helping a beginner engineer practise STAR answers.
@@ -44,7 +48,7 @@ const SCHEMA = {
         required: ["category", "score", "evidence", "gaps"],
         properties: {
           category: { type: "string", enum: ["star", "ownership", "results", "principle", "clarity", "reflection"] },
-          score: { type: "integer", minimum: 0, maximum: 100 },
+          score: { type: "integer" }, // the API rejects minimum/maximum here; the client clamps to 0-100
           evidence: { type: "array", items: { type: "string" } },
           gaps: { type: "array", items: { type: "string" } },
         },
@@ -88,6 +92,22 @@ const STUDY_GRADE_SCHEMA = {
 
 const client = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
 
+type Reply = { stop_reason: string; content: Array<{ type: string; text?: string }>; model: string };
+
+/** Asks MODEL, then FALLBACK_MODEL once if MODEL declined or the call was rate limited or failed on the API's side. */
+async function ask(params: Record<string, unknown>): Promise<Reply> {
+  const call = (model: string) => client!.messages.create({ ...params, model } as never) as unknown as Promise<Reply>;
+  const canFall = Boolean(FALLBACK_MODEL) && FALLBACK_MODEL !== MODEL;
+  try {
+    const msg = await call(MODEL);
+    if (msg.stop_reason !== "refusal" || !canFall) return msg;
+  } catch (e) {
+    const transient = e instanceof Anthropic.RateLimitError || (e instanceof Anthropic.APIError && (e.status ?? 0) >= 500);
+    if (!canFall || !transient) throw e;
+  }
+  return call(FALLBACK_MODEL);
+}
+
 function cors(res: import("node:http").ServerResponse) {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -107,7 +127,7 @@ const server = createServer(async (req, res) => {
     res.end();
     return;
   }
-  if (req.method === "GET" && req.url === "/api/health") return json(res, 200, { ok: true, model: MODEL, hasKey: Boolean(client) });
+  if (req.method === "GET" && req.url === "/api/health") return json(res, 200, { ok: true, model: MODEL, fallbackModel: FALLBACK_MODEL || null, hasKey: Boolean(client) });
   if (req.method === "POST" && req.url === "/api/study/grade") {
     if (!client) return json(res, 503, { error: "ANTHROPIC_API_KEY is not set on the proxy server." });
     let body = "";
@@ -131,16 +151,12 @@ const server = createServer(async (req, res) => {
       `Learner's answer:\n"""\n${input.answer}\n"""`,
     ].join("\n\n");
     try {
-      const response = await client.beta.messages.create({
-        model: MODEL,
+      const msg = await ask({
         max_tokens: 4000,
         system: STUDY_GRADE_SYSTEM,
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
         output_config: { effort: "low", format: { type: "json_schema", schema: STUDY_GRADE_SCHEMA } },
         messages: [{ role: "user", content: userPrompt }],
-      } as never);
-      const msg = response as unknown as { stop_reason: string; content: Array<{ type: string; text?: string }>; model: string };
+      });
       if (msg.stop_reason === "refusal") return json(res, 502, { error: "The model declined this request." });
       const text = msg.content.find((b) => b.type === "text")?.text ?? "";
       const parsed = JSON.parse(text) as { verdict: string; feedback: string; missedPoints: string[] };
@@ -177,16 +193,12 @@ const server = createServer(async (req, res) => {
       .filter(Boolean)
       .join("\n\n");
     try {
-      const response = await client.beta.messages.create({
-        model: MODEL,
+      const msg = await ask({
         max_tokens: 16000,
         system: SYSTEM,
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
         output_config: { effort: "medium", format: { type: "json_schema", schema: SCHEMA } },
         messages: [{ role: "user", content: userPrompt }],
-      } as never);
-      const msg = response as unknown as { stop_reason: string; content: Array<{ type: string; text?: string }>; model: string };
+      });
       if (msg.stop_reason === "refusal") return json(res, 502, { error: "The model declined this request." });
       const text = msg.content.find((b) => b.type === "text")?.text ?? "";
       const parsed = JSON.parse(text);
@@ -202,5 +214,5 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`OpsForge coaching proxy listening on http://localhost:${PORT} (model ${MODEL}, key ${client ? "configured" : "MISSING"})`);
+  console.log(`OpsForge coaching proxy listening on http://localhost:${PORT} (model ${MODEL}${FALLBACK_MODEL && FALLBACK_MODEL !== MODEL ? `, falls back to ${FALLBACK_MODEL}` : ""}, key ${client ? "configured" : "MISSING"})`);
 });
